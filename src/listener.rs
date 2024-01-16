@@ -8,6 +8,7 @@ use std::{
 use byte_string::ByteStr;
 use kcp::{Error as KcpError, KcpResult};
 use log::{debug, error, trace};
+use spin::mutex::SpinMutex;
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
     sync::mpsc,
@@ -15,7 +16,12 @@ use tokio::{
     time,
 };
 
-use crate::{config::KcpConfig, session::KcpSessionManager, stream::KcpStream};
+use crate::{
+    config::KcpConfig,
+    extender::{KcpTun, ProtocolExtender},
+    session::KcpSessionManager,
+    stream::KcpStream,
+};
 
 #[derive(Debug)]
 pub struct KcpListener {
@@ -34,13 +40,40 @@ impl KcpListener {
     /// Create an `KcpListener` bound to `addr`
     pub async fn bind<A: ToSocketAddrs>(config: KcpConfig, addr: A) -> KcpResult<KcpListener> {
         let udp = UdpSocket::bind(addr).await?;
-        KcpListener::from_socket(config, udp).await
+        KcpListener::from_socket_inner(config, udp, None).await
+    }
+
+    pub async fn bind_with_exteder<A: ToSocketAddrs>(
+        config: KcpConfig,
+        addr: A,
+        extender: Box<dyn ProtocolExtender>,
+    ) -> KcpResult<KcpListener> {
+        let udp = UdpSocket::bind(addr).await?;
+        KcpListener::from_socket_with_extender(config, udp, extender).await
     }
 
     /// Create a `KcpListener` from an existed `UdpSocket`
     pub async fn from_socket(config: KcpConfig, udp: UdpSocket) -> KcpResult<KcpListener> {
+        KcpListener::from_socket_inner(config, udp, None).await
+    }
+
+    async fn from_socket_inner(
+        config: KcpConfig,
+        udp: UdpSocket,
+        extender: Option<Box<dyn ProtocolExtender>>,
+    ) -> KcpResult<KcpListener> {
         let udp = Arc::new(udp);
         let server_udp = udp.clone();
+        // let extender: SpinMutex<Option<Box<dyn ProtocolExtender>>> = SpinMutex::new(extender);
+        let extender: SpinMutex<Option<KcpTun>> = SpinMutex::new(Some(KcpTun::new()));
+
+        let mut overhead = kcp::KCP_OVERHEAD;
+        {
+            let lock = extender.lock();
+            if lock.is_some() {
+                overhead += lock.as_ref().unwrap().header_len() as usize;
+            }
+        }
 
         let (accept_tx, accept_rx) = mpsc::channel(1024 /* backlogs */);
         let task_watcher = tokio::spawn(async move {
@@ -67,12 +100,23 @@ impl KcpListener {
 
                                 trace!("received peer: {}, {:?}", peer_addr, ByteStr::new(packet));
 
-                                if packet.len() < kcp::KCP_OVERHEAD {
+                                if packet.len() < overhead {
                                     error!("packet too short, received {} bytes, but at least {} bytes",
                                            packet.len(),
-                                           kcp::KCP_OVERHEAD);
+                                           overhead);
                                     continue;
                                 }
+                                let mut new_data = {
+                                    let mut lock = extender.lock();
+                                    if lock.is_some() {
+                                        let extender = lock.as_mut().unwrap();
+                                        extender.recv(packet.to_vec())
+                                    } else {
+                                        packet.to_vec()
+                                    }
+                                };
+                                let packet = &mut new_data;
+                                trace!("shaved peer: {}, {:?}", peer_addr, ByteStr::new(packet));
 
                                 let mut conv = kcp::get_conv(packet);
                                 if conv == 0 {
@@ -135,6 +179,14 @@ impl KcpListener {
             accept_rx,
             task_watcher,
         })
+    }
+
+    pub async fn from_socket_with_extender(
+        config: KcpConfig,
+        udp: UdpSocket,
+        extender: Box<dyn ProtocolExtender>,
+    ) -> KcpResult<KcpListener> {
+        KcpListener::from_socket_inner(config, udp, Some(extender)).await
     }
 
     /// Accept a new connected `KcpStream`

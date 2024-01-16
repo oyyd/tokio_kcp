@@ -9,15 +9,21 @@ use std::{
 use futures::future;
 use kcp::{Error as KcpError, Kcp, KcpResult};
 use log::{error, trace};
+use spin::mutex::SpinMutex;
 use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::{utils::now_millis, KcpConfig};
+use crate::{
+    extender::{KcpTun, ProtocolExtender},
+    utils::now_millis,
+    KcpConfig,
+};
 
 /// Writer for sending packets to the underlying UdpSocket
 struct UdpOutput {
     socket: Arc<UdpSocket>,
     target_addr: SocketAddr,
     delay_tx: mpsc::UnboundedSender<Vec<u8>>,
+    extender: SpinMutex<Option<Box<dyn ProtocolExtender>>>,
 }
 
 impl UdpOutput {
@@ -29,6 +35,7 @@ impl UdpOutput {
             let socket = socket.clone();
             tokio::spawn(async move {
                 while let Some(buf) = delay_rx.recv().await {
+                    // println!("send data {:?}", ByteStr::new(&data));
                     if let Err(err) = socket.send_to(&buf, target_addr).await {
                         error!("[SEND] UDP delayed send failed, error: {}", err);
                     }
@@ -40,22 +47,38 @@ impl UdpOutput {
             socket,
             target_addr,
             delay_tx,
+            extender: SpinMutex::new(Some(Box::new(KcpTun::new()))),
         }
     }
 }
 
 impl Write for UdpOutput {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.socket.try_send_to(buf, self.target_addr) {
-            Ok(n) => Ok(n),
+    fn write(&mut self, buf2: &[u8]) -> io::Result<usize> {
+        let (data, overhead) = {
+            let mut lock = self.extender.lock();
+            if lock.is_some() {
+                let extender = lock.as_mut().unwrap();
+                let data = extender.send(buf2.to_vec());
+                let overhead = extender.header_len();
+                (data, overhead)
+            } else {
+                (buf2.to_vec(), 0)
+            }
+        };
+
+        // println!("udpoutput write {:?}", ByteStr::new(&data));
+        match self.socket.try_send_to(&data, self.target_addr) {
+            Ok(n) => Ok(n - overhead as usize),
             Err(ref err) if err.kind() == ErrorKind::WouldBlock => {
                 // send return EAGAIN
                 // ignored as packet was lost in transmission
-                trace!("[SEND] UDP send EAGAIN, packet.size: {} bytes, delayed send", buf.len());
+                trace!(
+                    "[SEND] UDP send EAGAIN, packet.size: {} bytes, delayed send",
+                    data.len()
+                );
+                self.delay_tx.send(data.to_owned()).expect("channel closed unexpectly");
 
-                self.delay_tx.send(buf.to_owned()).expect("channel closed unexpectly");
-
-                Ok(buf.len())
+                Ok(buf2.len())
             }
             Err(err) => Err(err),
         }
@@ -324,6 +347,7 @@ impl KcpSocket {
 #[cfg(test)]
 mod test {
 
+    use byte_string::ByteStr;
     use kcp::Error as KcpError;
     use log::trace;
     use std::sync::Arc;
