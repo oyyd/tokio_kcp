@@ -1,4 +1,5 @@
 use std::{
+    borrow::BorrowMut,
     collections::{hash_map::Entry, HashMap},
     fmt::{self, Debug},
     net::SocketAddr,
@@ -20,7 +21,11 @@ use tokio::{
     time::{self, Instant},
 };
 
-use crate::{skcp::KcpSocket, KcpConfig};
+use crate::{
+    extender::{KcpTun, ProtocolExtender},
+    skcp::KcpSocket,
+    KcpConfig,
+};
 
 pub struct KcpSession {
     socket: SpinMutex<KcpSocket>,
@@ -29,6 +34,7 @@ pub struct KcpSession {
     session_close_notifier: Option<(mpsc::Sender<SocketAddr>, SocketAddr)>,
     input_tx: mpsc::Sender<Vec<u8>>,
     notifier: Notify,
+    extender: SpinMutex<Option<Box<dyn ProtocolExtender>>>,
 }
 
 impl Drop for KcpSession {
@@ -68,6 +74,7 @@ impl KcpSession {
             session_close_notifier,
             input_tx,
             notifier: Notify::new(),
+            extender: SpinMutex::new(Some(Box::new(KcpTun::new()))),
         }
     }
 
@@ -91,6 +98,14 @@ impl KcpSession {
 
         let io_task_handle = {
             let session = session.clone();
+            let mut overhead = kcp::KCP_OVERHEAD;
+            {
+                let lock = session.extender.lock();
+                if lock.is_some() {
+                    overhead += lock.as_ref().unwrap().header_len() as usize;
+                }
+            }
+
             tokio::spawn(async move {
                 let mut input_buffer = [0u8; 65536];
 
@@ -106,12 +121,22 @@ impl KcpSession {
                                 Ok(n) => {
                                     let input_buffer = &input_buffer[..n];
 
-                                    if input_buffer.len() < kcp::KCP_OVERHEAD {
+                                    if input_buffer.len() < overhead {
                                         error!("packet too short, received {} bytes, but at least {} bytes",
                                                input_buffer.len(),
-                                               kcp::KCP_OVERHEAD);
+                                               overhead);
                                         continue;
                                     }
+                                    let mut new_data = {
+                                        let mut lock = session.extender.lock();
+                                        if lock.is_some() {
+                                            let new_data = lock.as_mut().unwrap().recv(input_buffer.to_vec());
+                                            new_data
+                                        } else {
+                                            input_buffer.to_vec()
+                                        }
+                                    };
+                                    let input_buffer = &mut new_data;
 
                                     let input_conv = kcp::get_conv(input_buffer);
                                     trace!("[SESSION] UDP recv {} bytes, conv: {}, going to input {:?}",
