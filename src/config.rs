@@ -2,6 +2,8 @@ use std::{io::Write, time::Duration};
 
 use kcp::Kcp;
 
+use crate::extender::{KcpTun, ProtocolExtender};
+
 /// Kcp Delay Config
 #[derive(Debug, Clone, Copy)]
 pub struct KcpNoDelayConfig {
@@ -95,7 +97,8 @@ impl KcpConfig {
     /// Applies config onto `Kcp`
     #[doc(hidden)]
     pub fn apply_config<W: Write>(&self, k: &mut Kcp<W>) {
-        k.set_mtu(self.mtu).expect("invalid MTU");
+        k.set_mtu(self.mtu - KcpTun::new().header_len() as usize)
+            .expect("invalid MTU");
 
         k.set_nodelay(
             self.nodelay.nodelay,
