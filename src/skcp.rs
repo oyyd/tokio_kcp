@@ -146,6 +146,14 @@ impl KcpSocket {
                 trace!("[INPUT] Conv expected={} actual={} ignored", expected, actual);
                 return Ok(false);
             }
+            Err(KcpError::InvalidSegmentDataSize(expected, actual)) => {
+                trace!(
+                    "[INPUT] Invalid segment data size ignored, expected={} actual={} ignored",
+                    expected,
+                    actual
+                );
+                return Ok(false);
+            }
             Err(err) => return Err(err),
         }
         self.last_update = Instant::now();
